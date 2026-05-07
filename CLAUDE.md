@@ -43,4 +43,4 @@ cd ~/lm-inference/llama.cpp && cmake --build build --config Release -j$(nproc)
 
 ## 项目详情
 
-详见 [PROJECT.md](PROJECT.md)
+详见 [PROGRESS.md](PROGRESS.md)
