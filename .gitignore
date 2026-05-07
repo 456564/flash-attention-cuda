@@ -1,0 +1,28 @@
+# Claude Code
+.learn-code-cache/
+
+# llama.cpp (clone on device, too large to sync)
+llama.cpp/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Build artifacts
+build/
+*.o
+*.obj
+*.so
+*.dylib
+
+# Model files (large binaries)
+models/*.gguf
+
+# IDE
+.idea/
+.vscode/sftp.json
+
+# OS
+.DS_Store
+Thumbs.db
