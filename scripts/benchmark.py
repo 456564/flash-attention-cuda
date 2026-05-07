@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LLM inference benchmark — fixed prompts, multiple runs, averaged results."""
+"""LLM 推理基准测试 — 固定 prompt，多次运行取平均。"""
 
 import subprocess
 import json
@@ -9,11 +9,11 @@ import sys
 import os
 from datetime import datetime
 
-# === CONFIG ===
+# ==================== 配置 ====================
 LLAMA_BIN = "/home/jetson/lm-inference/llama.cpp/build/bin/llama-simple"
 MODEL_PATH = "/home/jetson/lm-inference/models/qwen2-0_5b-instruct-q8_0.gguf"
-N_RUNS = 10
-MAX_TOKENS = 128
+N_RUNS = 10          # 每个 prompt 跑多少轮
+MAX_TOKENS = 128     # 每次推理最多生成 token 数
 
 PROMPTS = [
     "Explain the concept of Flash Attention in one paragraph.",
@@ -25,12 +25,12 @@ PROMPTS = [
 
 
 def run_inference(prompt: str) -> dict:
-    """Run single inference via llama-simple, return parsed metrics."""
+    """调 llama-simple 做单次推理，解析性能指标返回 dict。"""
     t0 = time.perf_counter()
     result = subprocess.run(
         [LLAMA_BIN, "-m", MODEL_PATH, "-p", prompt, "-n", str(MAX_TOKENS)],
         capture_output=True, text=True, timeout=300,
-        input=""  # non-interactive
+        input=""  # 关 stdin，非交互模式
     )
     elapsed = time.perf_counter() - t0
 
@@ -40,7 +40,7 @@ def run_inference(prompt: str) -> dict:
         "wall_time_s": round(elapsed, 3),
     }
 
-    # llama-simple output:
+    # llama-simple 输出格式：
     #   "decoded N tokens in X s, speed: Z t/s"
     m = re.search(r"decoded\s+(\d+)\s+tokens\s+in\s+([\d.]+)\s+s,\s+speed:\s+([\d.]+)\s+t/s", output)
     if m:
@@ -48,21 +48,21 @@ def run_inference(prompt: str) -> dict:
         metrics["gen_time_s"] = float(m.group(2))
         metrics["gen_tps"] = float(m.group(3))
 
-    # prompt eval time = X ms / N tokens (Y ms per token, Z tokens per second)
+    # "prompt eval time = X ms / N tokens (Y ms per token, Z tokens per second)"
     m = re.search(r"prompt eval time\s*=\s*([\d.]+)\s+ms\s*/\s*(\d+)\s+tokens.*?([\d.]+)\s+tokens per second", output)
     if m:
         metrics["prompt_time_ms"] = float(m.group(1))
         metrics["prompt_tokens"] = int(m.group(2))
         metrics["prompt_tps"] = float(m.group(3))
 
-    # eval time = X ms / N runs (Y ms per token, Z tokens per second)
+    # "eval time = X ms / N runs (Y ms per token, Z tokens per second)"
     m = re.search(r"eval time\s*=\s*([\d.]+)\s+ms\s*/\s*(\d+)\s+runs.*?([\d.]+)\s+tokens per second", output)
     if m:
         metrics["eval_time_ms"] = float(m.group(1))
         metrics["eval_runs"] = int(m.group(2))
         metrics["eval_tps"] = float(m.group(3))
 
-    # total time = X ms / N tokens
+    # "total time = X ms / N tokens"
     m = re.search(r"total time\s*=\s*([\d.]+)\s+ms\s*/\s*(\d+)\s+tokens", output)
     if m:
         metrics["total_time_ms"] = float(m.group(1))
@@ -73,15 +73,15 @@ def run_inference(prompt: str) -> dict:
 
 def main():
     if not os.path.exists(LLAMA_BIN):
-        print(f"ERROR: binary not found: {LLAMA_BIN}")
+        print(f"ERROR: 找不到 llama-simple: {LLAMA_BIN}")
         sys.exit(1)
     if not os.path.exists(MODEL_PATH):
-        print(f"ERROR: model not found: {MODEL_PATH}")
+        print(f"ERROR: 找不到模型文件: {MODEL_PATH}")
         sys.exit(1)
 
     all_results = []
     for i in range(N_RUNS):
-        print(f"\n=== Run {i + 1}/{N_RUNS} ===")
+        print(f"\n=== 第 {i + 1}/{N_RUNS} 轮 ===")
         for j, prompt in enumerate(PROMPTS):
             print(f"  Prompt {j + 1}/{len(PROMPTS)}...", end=" ", flush=True)
             metrics = run_inference(prompt)
@@ -91,7 +91,7 @@ def main():
             tps = metrics.get("eval_tps", "N/A")
             print(f"{tps} tok/s")
 
-    # Aggregate
+    # 汇总统计
     gen_values = [m["eval_tps"] for m in all_results if "eval_tps" in m]
     if gen_values:
         avg_tps = round(sum(gen_values) / len(gen_values), 2)
@@ -112,17 +112,17 @@ def main():
         "max_eval_tps": max_tps,
     }
 
-    print(f"\n=== SUMMARY ===")
-    print(f"Average eval: {summary['avg_eval_tps']} tok/s")
-    print(f"Min:     {summary['min_eval_tps']} tok/s")
-    print(f"Max:     {summary['max_eval_tps']} tok/s")
+    print(f"\n=== 基准测试结果 ===")
+    print(f"平均 eval: {summary['avg_eval_tps']} tok/s")
+    print(f"最低:     {summary['min_eval_tps']} tok/s")
+    print(f"最高:     {summary['max_eval_tps']} tok/s")
 
     result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
     os.makedirs(result_dir, exist_ok=True)
     result_path = os.path.join(result_dir, "baseline_q8_0.json")
     with open(result_path, "w") as f:
         json.dump({"summary": summary, "runs": all_results}, f, indent=2)
-    print(f"\nResults saved to {result_path}")
+    print(f"\n结果已保存到 {result_path}")
 
 
 if __name__ == "__main__":
