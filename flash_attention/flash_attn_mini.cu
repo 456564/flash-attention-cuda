@@ -37,8 +37,7 @@ __global__ void flash_attn_kernel(
     extern __shared__ half2 sram[];
     half2 * Q_tile  = sram;                           // Br × head_dim/2
     half2 * KV_tile = sram + Br * head_dim_half;      // Bc × head_dim/2
-    // KQ scores 存 float (Br × Bc)
-    float * KQ      = (float *)(sram + Br * head_dim_half + Bc * head_dim_half);
+    // KQ_local 用寄存器算，不占 SRAM — 省空间给更大 tile
 
     // 1. 加载 Q tile 到 shared memory
     for (int i = tid; i < Br * head_dim_half; i += blockDim.x) {
@@ -240,10 +239,9 @@ int main() {
     cudaMemcpy(K_d, K_h, n_elements * sizeof(half), cudaMemcpyHostToDevice);
     cudaMemcpy(V_d, V_h, n_elements * sizeof(half), cudaMemcpyHostToDevice);
 
-    // SRAM 大小: Q_tile + KV_tile + KQ (作为共享内存的一部分)
+    // SRAM 大小: Q_tile + KV_tile (KQ_local 在寄存器)
     int sram_bytes = Br * head_dim_half * sizeof(half2)   // Q_tile
-                   + Bc * head_dim_half * sizeof(half2)   // KV_tile
-                   + Br * Bc * sizeof(float);              // KQ scores
+                   + Bc * head_dim_half * sizeof(half2);  // KV_tile
 
     printf("SRAM 占用: %d bytes (%.1f KB)\n", sram_bytes, sram_bytes / 1024.0f);
 
