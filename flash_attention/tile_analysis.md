@@ -2,7 +2,8 @@
 
 ## 环境
 
-- Orin Nano Super 8GB, 128 KB SRAM/SM, warp_size=32
+- Orin Nano Super 8GB, 8 SMs, 1536 threads/SM, warp=32
+- Shared Memory: 128 KB/SM, 48 KB/Block (默认)
 - Qwen2-0.5B: head_dim=64, 14 Q heads, 2 KV heads (GQA 7:1)
 
 ## SRAM 占用公式

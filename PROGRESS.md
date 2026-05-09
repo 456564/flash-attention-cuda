@@ -7,10 +7,13 @@
 
 ## 硬件
 
-- Jetson Orin Nano Super 8GB
-- 1024 CUDA Cores, 32 Tensor Cores, Ampere 架构
-- Shared Memory: 128KB/SM
-- INT8 dp4a 指令支持
+- Jetson Orin Nano Super 8GB, JetPack 6, R36.5.0
+- GPU: 8 SMs, 1536 threads/SM, Warp=32
+- Shared Memory: 128 KB/SM, 48 KB/Block (默认) — 可用 cudaFuncSetAttribute 解锁更多
+- Registers: 65536/Block
+- 显存: 7619 MiB, MemBus=128 bit, MemClock=1020 MHz
+- 带宽: 128bit × 1020MHz × 2(DDR) ÷ 8 = 32 GB/s 理论峰值
+- Core Clock: 1.02 GHz
 
 ## 项目结构
 
