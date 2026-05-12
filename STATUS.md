@@ -2,148 +2,139 @@
 
 ## 项目目标
 
-在 Jetson Orin Nano Super 8GB 上部署 Qwen2-0.5B，用 CUDA 算子优化做到极致 token/s。产出面试级项目素材，面向 Qualcomm/Intel/ARM/NVIDIA 外企实习。
+在 Jetson Orin Nano Super 8GB 上部署 Qwen2-0.5B，CUDA 算子优化 token/s。面向 Qualcomm/Intel/ARM/NVIDIA 外企实习。
 
 ## 全局规则
 
 全局 CLAUDE.md (`C:\Users\888\.claude\CLAUDE.md`)：
 - 变量/函数名英文，注释中文
-- 板子操作前标注 `[需要同步]` / `[无需同步]`
+- `[需要同步]` / `[无需同步]` 标注板子操作
 - 大文件优先国内源
-- 讲解用因果关系链：因为XX→所以YY→要做ZZ
+- **因果链讲解**：先因后果 → 再说怎么做。绝对不允许跳步骤（教学事故）
 - 项目文件 CLAUDE.md(稳定) + PROGRESS.md(动态)
 
 ## 项目文件架构
 
 ```
 D:\download\code\jetson orin nano super\
-├── CLAUDE.md          # 稳定层：规则、环境、命令、坑
-├── PROGRESS.md        # 动态层：路线图、进度、基准数据、面试矩阵
-├── scripts/benchmark.py   # 基准测试（argparse传参）
-├── results/           # 基准数据 JSON
-├── quant/quantize_analysis.md  # 第2周量化分析
-├── flash_attention/           # 第3周
-│   ├── flash_attn_mini.cu     # 完整可工作的 Flash Attention (我写的参考)
-│   ├── flash_attn_mini_s1.cu  # 用户手写版 (Step 1-3 完成，Step 4 一半)
+├── CLAUDE.md              # 稳定层：规则、环境、命令
+├── PROGRESS.md            # 动态层：路线图、基准数据
+├── STATUS.md              # 本文件：上下文交接快照
+├── scripts/benchmark.py   # 基准测试
+├── results/               # 基准 JSON
+├── quant/quantize_analysis.md  # 第2周 量化分析
+├── flash_attention/       # 第3周
+│   ├── flash_attn_mini.cu     # 完整可工作的参考 (我写的)
+│   ├── flash_attn_mini_s1.cu  # 用户手写版 (当前文件)
 │   ├── tile_analysis.md       # tile 选型分析
 │   └── LEARNING_LOG.md        # 学习档案
-├── llama.cpp/       # (远端) 推理框架
-└── models/          # (远端) GGUF 模型
+├── llama.cpp/             # (远端)
+└── models/                # (远端)
+
+远端：/home/jetson/lm-inference/
+开发：本地 PC，JetPack 6, CUDA 12.6 sm_87
+同步：VSCode SFTP
 ```
 
-## 工作流
+## 硬件规格 (cudaGetDeviceProperties)
 
-- 本地 PC 开发
-- 板子：Jetson Orin Nano Super, JetPack 6, CUDA 12.6 sm_87
-- VSCode SFTP 同步：`/home/jetson/lm-inference/`
-- Sync Local→Remote 推送代码，Sync Remote→Local 拉回结果
-- 用户是 C++/CUDA 初学者，需要逐步讲解
+8 SMs, 1536 threads/SM, warp=32, 128 KB SRAM/SM (48 KB/block 默认)
+65536 regs/block, 7619 MiB VRAM, 128-bit bus, 1020 MHz
+Core: 1.02 GHz Ampere
 
-## 硬件规格（板上 cudaGetDeviceProperties 实测）
+## 已完成的基准
 
-- GPU: Orin (Ampere)
-- SMs: 8
-- Max Threads/SM: 1536
-- Warp: 32
-- Shared Memory: 128 KB/SM, 48 KB/Block (默认)
-- Registers: 65536/Block
-- Global Memory: 7619 MiB
-- Core Clock: 1.02 GHz
-- Memory: 128-bit bus, 1020 MHz, LPDDR5
+### 第 1 周 Baseline ✅
+Q8_0: 74.2 tok/s avg
 
-## 已完成的基准数据
+### 第 2 周 INT8 量化 ✅
+Q4_K_M: 77.37 tok/s (+4.3%), PPL 1.0317 (+0.34%)
+Q4_0:   83.18 tok/s (+12.1%), PPL 1.0448 (+1.61%)
 
-### 第 1 周 Baseline (已完成)
-- Qwen2-0.5B Q8_0: avg 74.2 tok/s, min 64.7, max 82.68
-- 5 prompts × 10 runs benchmark
+## 第 3 周 Flash Attention — 理论学习 ✅，代码 🔄 60%
 
-### 第 2 周 INT8 量化 (已完成)
+### 理论：已完全理解
 
-| 模型 | 大小 | tok/s | PPL | vs Q8_0速度 | PPL损失 |
-|------|------|-------|-----|------------|--------|
-| Q8_0 | 507M | 74.2 | 1.0282 | baseline | baseline |
-| Q4_K_M | 380M | 77.37 | 1.0317 | +4.3% | +0.34% |
-| Q4_0 | 336M | 83.18 | 1.0448 | +12.1% | +1.61% |
-
-- PPL 用中文测试文本 6282 bytes，`llama-perplexity --ctx-size 512`
-- 模型参数：896维, 24层, 14 Q heads, 2 KV heads (GQA 7:1)
-- FFN 中间维度 4864，词表 151936
-- 分析文档：`quant/quantize_analysis.md`
-
-## 第 3 周 Flash Attention (当前，进度约 60%)
-
-### 已完成的理论理解
-
-用户已深入理解以下概念（用因果关系讲解）：
-
-**Attention 基础**：
-- QKV 哲学三问：Q=我要找谁，K=我是谁，V=我有什么
-- Tokenizer → Embedding → Transformer×24 → Output → softmax → 下一个token
-- QK 点积 = 64维逐维乘加求相似度
+**Attention 原理**：
+- QKV 哲学三问（Q=找谁, K=我是谁, V=我有什么）
+- Tokenizer→Embedding→Transformer×24→Output→softmax→next token
+- QK 点积 = 64 维逐位乘加求相似度
 - scale = 1/√64 防止点积爆炸
-- causal mask：用 -1e9f 遮住未来 token
-- softmax = exp(分数-max)/sum → 微小差异放大为概率分配
-- exp 物理意义 = 以 e 为基准的连续放大器（不是离散的翻倍 2）
-- VKQ/sum = 加权平均所有 token 的 V → 综合理解
+- causal mask 用 -1e9f 遮未来
+- softmax = exp(x-max)/sum 把微小差异放大为概率分配
+- exp 物理意义 = 以 e 为基准的连续放大器（不是 2 的离散翻倍）
+- VKQ/sum = 加权平均 = 理解上下文
 
 **Flash Attention 原理**：
-- HBM vs SRAM vs 寄存器：速度差 10-40 倍
-- 瓶颈在搬运，不在计算
-- Q→SRAM 常驻，K/V 从 HBM 分块搬进 SRAM，用完覆盖
-- online softmax：旧max < 新max → 旧 sum × exp(旧max-新max) 贬值
+- HBM 太慢(300 cycles) → Q 先搬进 SRAM(20 cycles) 常驻
+- K/V 太大放不下 SRAM → 分块搬入 KV_tile，用完覆盖
+- online softmax: 旧max<新max → 旧sum×exp(旧max-新max) 贬值
+- tile 选型: Br=32, Bc=64 是因为 SRAM 48KB + 32 线程对齐 + 循环 4 次平衡
 
-**硬件认知**：
+**CUDA 基础**：
+- GPU 内存层次：寄存器(0) > SRAM(20) > L2 > HBM(300)
 - half2 = 一次读 2 个 FP16，带宽翻倍
-- cudaMalloc = GPU HBM, new = CPU 堆
-- `__global__` = GPU kernel, `<<<grid,block,SRAM>>>` = 启动配置
-- `extern __shared__` = 运行时分配 SRAM
+- __global__ = GPU kernel, <<<grid,block,sram>>> = 启动配置
+- extern __shared__ = 运行时分配 SRAM
+- block = 同一 SM 上的线程组，可 __syncthreads()
+- warp = 32 线程，硬件同时调度
+- 多个 block/SM 可交替隐藏内存延迟
 
-### 代码进度 (flash_attn_mini_s1.cu)
+### 代码：flash_attn_mini_s1.cu 当前状态
 
-**Step 1 ✅** — 数据初始化
-- CPU float 数组生成随机 QKV，half 临时数组转 FP16
-- cudaMalloc + cudaMemcpy 搬到 GPU
+**Step 1 ✅** — CPU 数据初始化
+- float Q_h/K_h/V_h 随机生成，half 临时数组转 FP16 传 GPU
+- cudaMalloc + cudaMemcpy
 
 **Step 2 ✅** — CPU 参考 attention
-- 三重循环 (i,j,d)，因果 mask 用 j≤i 优化
-- O_h 为标准答案
+- 三重循环 (i,j,d)，因果 mask 用 j<=i 优化
+- O_h = 标准答案
 
 **Step 3 ✅** — 朴素 GPU kernel
-- `naive_attn_kernel<<<1,256>>>`，每线程处理 1 token
-- half2 点积（head_dim_half=32 次循环替代 64 次）
-- 误差 0.000015
+- naive_attn_kernel<<<1,256>>>，每线程 1 token
+- half2 点积，误差 0.000015
 
-**Step 4 🔄** — Tiled Flash Attention kernel (写了一半)
-- `flash_attn_kernel` 声明 OK
-- `extern __shared__` + Q_tile/KV_tile 分区 OK
-- Q_tile 协作加载 OK（32线程 × 32元素）
-- Br=32, Bc=64
-- **未完成**：online softmax 累加器初始化、K/V 分块循环、V 加权累加
+**Step 4 🔄** — Flash Attention kernel (正在写)
+- extern __shared__ sram 分区：Q_tile(4KB) + KV_tile(8KB)
+- Q_tile 协作加载 ✅ (32 线程 × 32 列 = 1024 元素)
+- online softmax 初始化 ✅ (VKQ, KQ_max, KQ_sum)
+- K/V 外循环骨架 ✅ (kv_start += Bc)
+- **K 加载** ✅ (95-99 行)
+- **QK 点积** 🔄 (103-110 行有 bug：缺 j 循环、dot 未声明、half2 直接 .x.y)
+- **online softmax** ⬜ 下一步
+- **V 加载 + VKQ 累加** ⬜
+- **归一化输出** ⬜
 
-### 完整参考 kernel 在哪
+### 完整参考在哪
 
-`flash_attn_mini.cu` — 已调通，板上 0 误差运行：
-- SRAM 占用 12 KB
-- `nvcc -arch=sm_87 -O3` 编译验证过
-- CuDA kernel + CPU 参考完整实现
+`flash_attn_mini.cu` — 已调通，板子 0 误差运行。
 
-## 用户特点
+## 当前待修复的代码 (103-110 行)
 
-- 大三学生（2027届），端侧 AI 方向
-- 中文母语，C++/CUDA 初学者
-- 目标外企实习：Qualcomm/Intel/ARM/NVIDIA，暑假前投递，6/30 截止
-- 偏好：因果关系讲解（因为XX→所以YY→要做ZZ），不要背书，要理解物理意义
-- 当前状态：已学大量内容，有点学不动了，可能需要换项目或换方式
+```cpp
+// ---- 当前有 bug 的 QK 点积 ----
+for(int d = 0; d < head_dim_half; d++){
+    half2 qv = Q_tile[my_row * head_dim_half + d];
+    half2 kv = KV_tile[j * head_dim_half + d];  // j 不存在！
+    float2 qf = __half22float2(qv);
+    float2 kf = __half22float2(kv);
+    dot += qv.x * kv.x + qv.y * kv.y;  // half2 不能直接用 .x .y！
+}
 
-## 当前 git 状态
-
+// 需要改成：
+// 1. 外层加 for (int j = 0; j < kv_len; j++)
+// 2. 声明 float KQ_local[64] + new_max
+// 3. half2 → float2 后访问 qf.x kf.x
+// 4. dot 做 scale + causal mask
+// 5. 每算一个分数存 KQ_local[j] 并更新 new_max
 ```
-master 分支
-ee350ee docs: learning log for Step 1 flash attention
-87686c7 docs: Orin device specs from cudaGetDeviceProperties
-6a8e1d2 feat: tile analysis doc + fix KQ warning
-9304453 feat: Week 3 mini Flash Attention kernel (standalone)
-36eed47 refactor: align with global CLAUDE.md structure
-```
 
-未提交：flash_attn_mini_s1.cu 的最新修改（Step 4 部分）
+## 用户特点和教学偏好
+
+- 大三学生(2027届)，端侧AI，C++/CUDA 初学者
+- 目标外企实习：Qualcomm/Intel/ARM/NVIDIA，6/30 截止
+- **必须因果链讲解**：先物理原因→推理出设计→才写代码
+- "不要只丢解释，要配合代码逐步因果推理"
+- 当前状态：学了很多理论有倦怠感，代码语法层面还在熟悉
+- "第一次不会全记住" — 用户接受渐进学习
+- "你不要全写，解释下一步就行" — 只解释逻辑，用户自己动手写代码

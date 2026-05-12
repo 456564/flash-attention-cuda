@@ -78,6 +78,43 @@ __global__ void flash_attn_kernel( // flash attention
     }
     __syncthreads(); // 确保所有线程都完成了Q_tile的加载
 
+    int my_row = tid; // 每个线程负责计算Q_tile中的一行与K/V的点积
+    if (my_row >= Br || q_start + my_row >= seq_len) return; // 防止越界
+
+    float VKQ[64] = {0};
+    float KQ_max = -1e9f;
+    float KQ_sum = 0.0f;
+
+    // 循环K/V块
+    for(int kv_start = 0; kv_start < seq_len; kv_start += Bc){
+        int kv_end = kv_start + Bc;
+        if (kv_end > seq_len) kv_end = seq_len;
+        int kv_len = kv_end - kv_start;
+
+        // ---- A. 加载 K 块到 KV_tile ----
+        for (int idx = tid; idx < kv_len * head_dim_half; idx += Br){
+            int row = idx / head_dim_half;
+            int col = idx % head_dim_half;
+            KV_tile[idx] = K[(kv_start + row) * head_dim_half + col];
+        }
+
+        __stncthreads(); // 确保所有线程都完成了K块的加载
+
+        // ---- B. 计算 QK 点积 ----
+        for(int j = 0; j < kv_len; j++){
+            
+            for(int d = 0; d < head_dim_half; d++){
+                half2 qv = Q_tile[my_row * head_dim_half + d];
+                half2 kv = KV_tile[j * head_dim_half + d];
+                float2 qf = __half22float2(qv);
+                float2 kf = __half22float2(kv);
+                dot += qv.x * kv.x + qv.y * kv.y; // 计算QK的点积，累加到dot变量中
+            }
+        }
+
+    
+    }
+
 }
 
 int main() {
