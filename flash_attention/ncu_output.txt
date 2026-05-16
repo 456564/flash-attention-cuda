@@ -1,0 +1,20 @@
+==PROF== Connected to process 7848 (/home/jetson/lm-inference/flash_attention/flash_attn_mini_s1)
+==PROF== Profiling "flash_attn_kernel" - 0 (1/1): Application replay pass 1
+CPU 参考完成: O_h[0]=0.019064, O_h[100]=-0.013245
+Naive GPU vs CPU 最大误差: 0.000015
+Flash GPU vs CPU 最大误差: 0.000015
+
+========== 性能对比 (SEQ=256, D=64, warmup=5) ==========
+Naive:  2.9874 ms/run  (total 149.37 ms / 50 runs)
+Flash:  0.0063 ms/run  (total 62.72 ms / 10000 runs)
+加速比: 476.28x
+
+第 3 周完成
+==PROF== Disconnected from process 7848
+==PROF== Connected to process 7861 (/home/jetson/lm-inference/flash_attention/flash_attn_mini_s1)
+==PROF== Profiling "flash_attn_kernel" - 0 (1/1): Application replay pass 2
+
+==ERROR== An error was reported by the driver:
+==ERROR== LaunchFailed
+==PROF== Trying to shutdown target application
+==ERROR== An error occurred while trying to profile.

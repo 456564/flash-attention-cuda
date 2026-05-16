@@ -51,7 +51,7 @@ Q8_0: 74.2 tok/s avg
 Q4_K_M: 77.37 tok/s (+4.3%), PPL 1.0317 (+0.34%)
 Q4_0:   83.18 tok/s (+12.1%), PPL 1.0448 (+1.61%)
 
-## 第 3 周 Flash Attention — 理论学习 ✅，代码 🔄 60%
+## 第 3 周 Flash Attention — 理论学习 ✅，代码 ✅
 
 ### 理论：已完全理解
 
@@ -80,61 +80,91 @@ Q4_0:   83.18 tok/s (+12.1%), PPL 1.0448 (+1.61%)
 - warp = 32 线程，硬件同时调度
 - 多个 block/SM 可交替隐藏内存延迟
 
-### 代码：flash_attn_mini_s1.cu 当前状态
+### 代码：flash_attn_mini_s1.cu 全部完成
 
 **Step 1 ✅** — CPU 数据初始化
 - float Q_h/K_h/V_h 随机生成，half 临时数组转 FP16 传 GPU
-- cudaMalloc + cudaMemcpy
 
 **Step 2 ✅** — CPU 参考 attention
 - 三重循环 (i,j,d)，因果 mask 用 j<=i 优化
-- O_h = 标准答案
 
 **Step 3 ✅** — 朴素 GPU kernel
 - naive_attn_kernel<<<1,256>>>，每线程 1 token
-- half2 点积，误差 0.000015
 
-**Step 4 🔄** — Flash Attention kernel (正在写)
-- extern __shared__ sram 分区：Q_tile(4KB) + KV_tile(8KB)
-- Q_tile 协作加载 ✅ (32 线程 × 32 列 = 1024 元素)
-- online softmax 初始化 ✅ (VKQ, KQ_max, KQ_sum)
-- K/V 外循环骨架 ✅ (kv_start += Bc)
-- **K 加载** ✅ (95-99 行)
-- **QK 点积** 🔄 (103-110 行有 bug：缺 j 循环、dot 未声明、half2 直接 .x.y)
-- **online softmax** ⬜ 下一步
-- **V 加载 + VKQ 累加** ⬜
-- **归一化输出** ⬜
+**Step 4 ✅** — Flash Attention tiled kernel
+- Q_tile 协作加载，KV_tile 分块复用
+- QK 点积 + scale + causal mask + KQ_local 暂存
+- online softmax（旧值贬值 + 新块 exp）
+- V 加载覆盖 KV_tile，VKQ 加权累加
+- 归一化输出 VKQ/KQ_sum（kv 循环外一把除）
 
-### 完整参考在哪
+### 验证结果
 
-`flash_attn_mini.cu` — 已调通，板子 0 误差运行。
+板子编译运行：Naive GPU vs CPU 最大误差: 0.000015，Flash GPU vs CPU 最大误差: 0.000015。FP16 精度范围内一致，Flash Attention 实现正确。
 
-## 当前待修复的代码 (103-110 行)
+## 第 4 周 Nsight 性能分析 🔄 80%
 
-```cpp
-// ---- 当前有 bug 的 QK 点积 ----
-for(int d = 0; d < head_dim_half; d++){
-    half2 qv = Q_tile[my_row * head_dim_half + d];
-    half2 kv = KV_tile[j * head_dim_half + d];  // j 不存在！
-    float2 qf = __half22float2(qv);
-    float2 kf = __half22float2(kv);
-    dot += qv.x * kv.x + qv.y * kv.y;  // half2 不能直接用 .x .y！
-}
+### Nsight Compute profiling ✅
 
-// 需要改成：
-// 1. 外层加 for (int j = 0; j < kv_len; j++)
-// 2. 声明 float KQ_local[64] + new_max
-// 3. half2 → float2 后访问 qf.x kf.x
-// 4. dot 做 scale + causal mask
-// 5. 每算一个分数存 KQ_local[j] 并更新 new_max
-```
+| 指标 | Naive | Flash | 解读 |
+|------|-------|-------|------|
+| Grid | 1 block × 256 thr | 8 block × 32 thr | Flash 用满 8 SM |
+| Registers/thread | 40 | 54 | VKQ+KQ_local 用寄存器 |
+| Static SRAM | 0 | 12.29 KB | Q_tile + KV_tile |
+| Compute Throughput | 1.61% | 3.94% | Flash 2.4x 更多算力利用 |
+| Memory Throughput | 9.62% | 25.87% | Flash 更多 SRAM 带宽 |
+| L1/TEX Throughput | 77.00% | 26.05% | Flash L1 压力降 3x |
+| L2 Throughput | 0.78% | 12.03% | Flash 用更多 L2 (8 SM 共享) |
+| Theoretical Occupancy | 100% | 25% | SRAM 12KB/block 限制 |
+| Achieved Occupancy | 12.19% | 2.08% | kernel 太小太快 |
+
+### 多 head + GQA + KV cache 扩展 ✅
+
+| 扩展 | 实现 | 验证 |
+|------|------|------|
+| 多 head (14 Q × 2 KV) | blockIdx.z 选 head，gqa_ratio=7 | 误差 0.000015 |
+| KV cache 变长 | kv_max 参数，动态截断 kv 循环 | kv_max=128/256 均 0.000015 |
+| GQA 指针偏移 | Q/K/V += head×offset，编译期 SRAM 大小 | 14 head 全对 |
+
+### 知识掌握评估 (2026-05-15)
+
+15 题自测：29/75 (39%) → 漏洞修复后 → 估计 55/75 (73%)
+
+| 领域 | 掌握 | 状态 |
+|------|------|------|
+| Attention 原理 | QKV 含义、softmax、causal mask、scale 方差控制 | ✅ |
+| Flash Attention 算法 | Q 常驻、KV 分块、online softmax 贬值推导 | ✅ |
+| CUDA 编程 | <<<>>>、__shared__、half2、threadIdx/blockIdx | ✅ |
+| GPU 内存层次 | 寄存器/SRAM/L1 同级/L2/HBM 速度与大小 | ✅ |
+| SM/block/warp/grid | 关系、上限、occupancy 三约束 | ✅ |
+| Head/GQA | 14 head 拆 Q，K/V 共享 7x 省显存 | ✅ |
+| Warp 级并行 | SIMD 同指令、divergence 串行化、调度器 | ✅ |
+| Br/Bc 选型 | warp 对齐 + SRAM 48KB 约束 + 循环平衡 | ✅ |
+| Nsight Compute | SpeedOfLight/Occupancy/Workload 各项含义 | ✅ |
+| Roofline model | 算术密度、compute/memory roof、bound 判断 | ⚠️ 理论懂，未画图 |
+| Bank conflict | 32 bank、stride-32=冲突、stride-1=安全 | ⚠️ 理论懂，未 ncu 验证 |
+| llama.cpp 对比 | fattn-tile 逐段对照、10 维差异分析 | ✅ |
+| 面试表述 | 三段式：手写算子 + profiling + 生产源码 | ✅ |
+
+### 未填漏洞
+
+| # | 漏洞 | 优先级 |
+|---|------|--------|
+| 1 | Roofline 画图实操 | 中 |
+| 2 | Bank conflict ncu 验证 | 低 |
+| 3 | 量化 + flash 共存 | 中 |
+| 4 | Kernel launch 到硬件执行 | 低 |
+| 5 | FP16 精度损失来源 | 低 |
+
+---
 
 ## 用户特点和教学偏好
 
-- 大三学生(2027届)，端侧AI，C++/CUDA 初学者
+- 大三学生(2027届)，端侧AI/推理引擎/AI Infra 方向
 - 目标外企实习：Qualcomm/Intel/ARM/NVIDIA，6/30 截止
+- 当前面试目标：AI Infra 推理引擎优化方向
 - **必须因果链讲解**：先物理原因→推理出设计→才写代码
 - "不要只丢解释，要配合代码逐步因果推理"
-- 当前状态：学了很多理论有倦怠感，代码语法层面还在熟悉
 - "第一次不会全记住" — 用户接受渐进学习
-- "你不要全写，解释下一步就行" — 只解释逻辑，用户自己动手写代码
+- "你不要全写，解释下一步就行" — 只解释逻辑，自己动手写
+- 当前状态：手写 CUDA kernel 跑通、Nsight 数据到手、面试回答初步成型

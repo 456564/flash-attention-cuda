@@ -3,9 +3,12 @@
 #include <cuda_runtime.h>  // cudaMalloc, cudaMemcpy, cudaFree
 #include <cuda_fp16.h>     // half, __float2half
 #include <cmath>           // sqrt, exp, expf
+#include <chrono>          // high_resolution_clock for timing
 
 constexpr int SEQ_LEN  = 256;
 constexpr int HEAD_DIM = 64;
+constexpr int N_Q_HEADS = 14;
+constexpr int N_KV_HEADS = 2;
 
 constexpr int Br = 32;
 constexpr int Bc = 64;
@@ -60,14 +63,22 @@ __global__ void naive_attn_kernel(
 
 __global__ void flash_attn_kernel( // flash attention
     const half2 * Q, const half2 * K, const half2 * V,
-    float * O, int seq_len, int head_dim_half, float scale
+    float * O, int seq_len, int kv_max,int head_dim_half, float scale,
+    int gqa_ratio
 ){
-    extern __shared__ half2 sram[]; // 先声明half2类型的共享内存，后续会根据需要划分为Q_tile和KV_tile
+    __shared__ half2 sram[(Br + Bc) * (HEAD_DIM / 2)]; // SRAM: Q_tile(2KB) + KV_tile(4KB) = 6KB, 编译期固定
     half2 * Q_tile = sram;          // Q_tile占用前32*32个half2元素的共享内存，大小为32*32*4字节 = 4096字节
     half2 * KV_tile = sram + Br * head_dim_half;
 
     int q_start = blockIdx.x * Br;  // 每 block 处理 Br 行 Q
     int tid = threadIdx.x;
+
+    int head_q = blockIdx.z;
+    int head_kv = head_q / gqa_ratio;
+    int offset = SEQ_LEN * head_dim_half;
+    Q += head_q * offset;
+    K += head_kv * offset;
+    V += head_kv * offset;
 
     // 协作加载 Q_tile：32 个线程并行，每个搬几个元素
     for (int idx = tid; idx < Br * head_dim_half; idx += Br) {
@@ -84,11 +95,13 @@ __global__ void flash_attn_kernel( // flash attention
     float VKQ[64] = {0};
     float KQ_max = -1e9f;
     float KQ_sum = 0.0f;
+    float KQ_local[64];
+    float new_max = -1e9f;
 
     // 循环K/V块
-    for(int kv_start = 0; kv_start < seq_len; kv_start += Bc){
+    for(int kv_start = 0; kv_start < kv_max; kv_start += Bc){
         int kv_end = kv_start + Bc;
-        if (kv_end > seq_len) kv_end = seq_len;
+        if (kv_end > kv_max) kv_end = kv_max;
         int kv_len = kv_end - kv_start;
 
         // ---- A. 加载 K 块到 KV_tile ----
@@ -98,118 +111,225 @@ __global__ void flash_attn_kernel( // flash attention
             KV_tile[idx] = K[(kv_start + row) * head_dim_half + col];
         }
 
-        __stncthreads(); // 确保所有线程都完成了K块的加载
+        __syncthreads(); // 确保所有线程都完成了K块的加载
 
         // ---- B. 计算 QK 点积 ----
         for(int j = 0; j < kv_len; j++){
-            
+            float dot = 0;
             for(int d = 0; d < head_dim_half; d++){
                 half2 qv = Q_tile[my_row * head_dim_half + d];
                 half2 kv = KV_tile[j * head_dim_half + d];
                 float2 qf = __half22float2(qv);
                 float2 kf = __half22float2(kv);
-                dot += qv.x * kv.x + qv.y * kv.y; // 计算QK的点积，累加到dot变量中
+                dot += qf.x * kf.x + qf.y * kf.y; // 计算QK的点积，累加到dot变量中
             }
+            dot *= scale; // 缩放点积结果，通常是除以 sqrt(head_dim)，以防止数值过大导致softmax不稳定
+            if (kv_start + j > q_start + my_row) //  防止偷看到后面的token的信息，保证自回归的因果性
+                dot = -1e9f;
+            KQ_local[j] = dot; // 将点积结果存储在KQ_local数组中，长度为当前K块的长度
+            if (dot > new_max) new_max = dot; // 更新当前块的最大分数，用于数值稳定的softmax计算
         }
 
-    
+        // ---- C. online softmax ----
+        if(new_max > KQ_max){ // old_max用old_scale贬值,用new_max覆盖old_max,用new_max更新old_scale
+            float old_scale = expf(KQ_max - new_max);
+            for(int d = 0; d < HEAD_DIM; d++)
+                VKQ[d] *= old_scale; // 把之前块的加权和乘以old_scale，贬值之前块的分数权重
+            KQ_sum *= old_scale;
+            KQ_max = new_max;
+        }
+        for (int j = 0; j < kv_len; j++){
+            float score = expf(KQ_local[j] - KQ_max);
+            KQ_sum += score; // 累加分数权重的和，用于后续的归一化
+            KQ_local[j] = score;
+        }
+        __syncthreads();
+
+        // ---- D. 计算加权求和 ----
+        for (int idx = tid; idx < kv_len * head_dim_half; idx += Br){
+            int row = idx / head_dim_half;
+            int col = idx % head_dim_half;
+            KV_tile[idx] = V[(kv_start + row) * head_dim_half + col];
+        }
+        __syncthreads();
+
+        for (int j = 0; j < kv_len; j++){
+            for (int d = 0; d < head_dim_half; d++){
+                half2 vv = KV_tile[j * head_dim_half + d];
+                float2 vf = __half22float2(vv);
+                VKQ[2*d] += KQ_local[j] * vf.x;
+                VKQ[2*d+1] += KQ_local[j] * vf.y;
+            }
+        }
+        __syncthreads();
     }
+    // ---- F. 归一化，得到最终的输出O ----
+    for (int d = 0; d < HEAD_DIM; d++){
+        O[(head_q * SEQ_LEN + q_start + my_row) * HEAD_DIM + d] = VKQ[d] / KQ_sum; // 归一化，把分数权重转成0-1的概率，得到最终的输出O
+    }
+
 
 }
 
 int main() {
-    int n = SEQ_LEN * HEAD_DIM; // 计算总元素数量（序列长度乘以头部维度）
+    int n_q  = N_Q_HEADS  * SEQ_LEN * HEAD_DIM;  // 14×16384=229376
+    int n_kv = N_KV_HEADS * SEQ_LEN * HEAD_DIM;  //  2×16384=32768
 
     half * Q_d, * K_d, * V_d; // Q、K、V的设备内存指针（GPU的全局内存）
     float * O_d;              // 输出O的设备内存指针（GPU的全局内存）
     float * Q_h, * K_h, * V_h, * O_h; // Q、K、V、O的主机内存指针（CPU的堆内存）
 
-    Q_h = new float[n];        // Q的本地内存分配（CPU的堆内存）
-    K_h = new float[n];        // K的本地内存分配（CPU的堆内存）
-    V_h = new float[n];        // V的本地内存分配（CPU的堆内存）
-    O_h = new float[n];        // O的本地内存分配（CPU的堆内存）
+    Q_h = new float[n_q];        // Q的本地内存分配（CPU的堆内存）
+    K_h = new float[n_kv];        // K的本地内存分配（CPU的堆内存）
+    V_h = new float[n_kv];        // V的本地内存分配（CPU的堆内存）
+    O_h = new float[n_q];        // O的本地内存分配（CPU的堆内存）
 
     srand(42); // 设置随机数种子，确保每次运行生成相同的随机数序列
-    for (int i = 0; i < n; i++){
-        float r = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;     // 生成[-0.05, 0.05]范围内的随机数（单精度浮点数，FP32，约7位有效数字）
-        float r2 = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;    
-        float r3 = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
-        Q_h[i] = (r);                               // 将随机数赋值给 Q_h 数组的第 i 个元素 (FP32，4字节/元素)
-        K_h[i] = (r2);                              
-        V_h[i] = (r3);                              
+    // Q 单独：14 head
+    for (int h = 0; h < N_Q_HEADS; h++){
+        for (int i = 0; i < SEQ_LEN * HEAD_DIM; i++){
+            Q_h[h * SEQ_LEN * HEAD_DIM + i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+        }
+    }
+    // K/V 单独：2 head
+    for (int h = 0; h < N_KV_HEADS; h++){
+        for (int i = 0; i < SEQ_LEN * HEAD_DIM; i++){
+            K_h[h * SEQ_LEN * HEAD_DIM + i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+            V_h[h * SEQ_LEN * HEAD_DIM + i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+        }
     }
 
-    // 在CPU计算attention,作为标准答案
-    for (int i = 0; i < SEQ_LEN; i++){
-        float scores[SEQ_LEN];
-        float max_score = -1e9f;
-        for (int j = 0; j <= i; j++){
-            float dot = 0;
-            for (int d = 0; d < HEAD_DIM; d++){
-                dot += Q_h[i * HEAD_DIM +d] * K_h[j * HEAD_DIM +d];
-            }
-            dot /= sqrt(HEAD_DIM);
-            scores[j] = dot;
-            if (dot > max_score) max_score = dot;
-        }
-        float sum = 0;
-        for (int j = 0; j <= i; j++){
-            scores[j] = exp(scores[j] - max_score);
-            sum += scores[j];
-        }
-        for (int d = 0; d < HEAD_DIM; d++){
-            float acc = 0;
+    // CPU 参考：14 head attention，GQA（Q 14头 × K/V 2头，gqa_ratio=7）
+    int gqa_ratio = N_Q_HEADS / N_KV_HEADS;
+    for (int h = 0; h < N_Q_HEADS; h++){
+        int head_kv = h / gqa_ratio;  // Q head h 对应 KV head
+        for (int i = 0; i < SEQ_LEN; i++){
+            float scores[SEQ_LEN];
+            float max_score = -1e9f;
             for (int j = 0; j <= i; j++){
-                acc += scores[j] / sum * V_h[j * HEAD_DIM + d];
+                float dot = 0;
+                for (int d = 0; d < HEAD_DIM; d++){
+                    dot += Q_h[(h * SEQ_LEN + i)        * HEAD_DIM + d]
+                        * K_h[(head_kv * SEQ_LEN + j)   * HEAD_DIM + d];
+                }
+                dot /= sqrt(HEAD_DIM);
+                scores[j] = dot;
+                if (dot > max_score) max_score = dot;
             }
-            O_h[i * HEAD_DIM + d] = acc;
+            float sum = 0;
+            for (int j = 0; j <= i; j++){
+                scores[j] = exp(scores[j] - max_score);
+                sum += scores[j];
+            }
+            for (int d = 0; d < HEAD_DIM; d++){
+                float acc = 0;
+                for (int j = 0; j <= i; j++){
+                    acc += scores[j] / sum * V_h[(head_kv * SEQ_LEN + j) * HEAD_DIM + d];
+                }
+                O_h[(h * SEQ_LEN + i) * HEAD_DIM + d] = acc;
+            }
         }
     }
-    printf("CPU 参考完成: O_h[0]=%f, O_h[100]=%f\n", O_h[0], O_h[100]);
+    printf("CPU 参考完成: O_h[0]=%f\n", O_h[0]);    
 
     // 在 GPU 全局内存上为 Q/K/V/O 分配空间
-    cudaMalloc(&Q_d, n * sizeof(half));   // 16384 个 half × 2 字节 = 32768 字节
-    cudaMalloc(&K_d, n * sizeof(half));
-    cudaMalloc(&V_d, n * sizeof(half));
-    cudaMalloc(&O_d, n * sizeof(float));  // 输出用 float，4 字节/元素
+    cudaMalloc(&Q_d, n_q * sizeof(half));   // 16384 个 half × 2 字节 = 32768 字节
+    cudaMalloc(&K_d, n_kv * sizeof(half));
+    cudaMalloc(&V_d, n_kv * sizeof(half));
+    cudaMalloc(&O_d, n_q * sizeof(float));  // 输出用 float，4 字节/元素
 
     // 将 Q/K/V 从主机内存复制到设备内存
-    half * Q_half = new half[n]; // 临时数组，用于存储转换后的半精度值
-    half * K_half = new half[n];
-    half * V_half = new half[n];
-    for (int i = 0; i < n; i++) {
-        Q_half[i] = __float2half(Q_h[i]); // 将单精度浮点数转换为半精度并存储在临时数组中
+    half * Q_half = new half[n_q]; // 临时数组，用于存储转换后的半精度值
+    half * K_half = new half[n_kv];
+    half * V_half = new half[n_kv];
+    for (int i = 0; i < n_q; i++)
+        Q_half[i] = __float2half(Q_h[i]);
+    for (int i = 0; i < n_kv; i++){
         K_half[i] = __float2half(K_h[i]);
         V_half[i] = __float2half(V_h[i]);
     }
-    cudaMemcpy(Q_d, Q_half, n * sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(K_d, K_half, n * sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(V_d, V_half, n * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(Q_d, Q_half, n_q * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(K_d, K_half, n_kv * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(V_d, V_half, n_kv * sizeof(half), cudaMemcpyHostToDevice);
 
-    naive_attn_kernel<<<1, 256>>>(
-        (const half2 *)Q_d, (const half2 *)K_d, (const half2 *)V_d,
-        O_d, SEQ_LEN, HEAD_DIM/2, 1.0f/sqrtf(HEAD_DIM)
-    );
+    // ---- 计时：naive kernel (warmup=5, iters=50) ----
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    const int warmup = 5;
+    const int iters  = 50;
+
+    for (int k = 0; k < warmup; k++)
+        naive_attn_kernel<<<1, 256>>>(
+            (const half2 *)Q_d, (const half2 *)K_d, (const half2 *)V_d,
+            O_d, SEQ_LEN, HEAD_DIM/2, 1.0f/sqrtf(HEAD_DIM));
     cudaDeviceSynchronize();
 
-    float * O_gpu = new float[n]; // 用于从设备内存复制回主机内存的数组，存储 GPU 计算的结果
-    cudaMemcpy(O_gpu, O_d, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaEventRecord(start, 0);
+    for (int k = 0; k < iters; k++)
+        naive_attn_kernel<<<1, 256>>>(
+            (const half2 *)Q_d, (const half2 *)K_d, (const half2 *)V_d,
+            O_d, SEQ_LEN, HEAD_DIM/2, 1.0f/sqrtf(HEAD_DIM));
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    float ms_naive = 0;
+    cudaEventElapsedTime(&ms_naive, start, stop);
 
-    float max_err = 0;
-    for (int i = 0; i < n; i++){
+    float * O_gpu = new float[n_q];
+    cudaMemcpy(O_gpu, O_d, n_q * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float max_err_naive = 0;
+    for (int i = 0; i < SEQ_LEN * HEAD_DIM; i++){
         float err = fabsf(O_gpu[i] - O_h[i]);
-        if (err > max_err) max_err = err;
+        if (err > max_err_naive) max_err_naive = err;
     }
-    printf("GPU vs CPU最大误差: %f\n", max_err);
+    printf("Naive GPU vs CPU 最大误差: %f\n", max_err_naive);
+
+    // ---- 计时：flash kernel (多 head：dim3 grid, gqa_ratio) ----
+    float * O_d2;
+    cudaMalloc(&O_d2, n_q * sizeof(float));
+    dim3 grid_3d((SEQ_LEN + Br - 1) / Br, 1, N_Q_HEADS);  // 8×1×14=112 blocks
+    gqa_ratio = N_Q_HEADS / N_KV_HEADS;               // 7
+    const int flash_iters = 10000;
+
+    for (int k = 0; k < warmup; k++)
+        flash_attn_kernel<<<grid_3d, Br>>>(
+            (const half2 *)Q_d, (const half2 *)K_d, (const half2 *)V_d,
+            O_d2, SEQ_LEN, SEQ_LEN, HEAD_DIM/2, 1.0f/sqrtf(HEAD_DIM), gqa_ratio);
+    cudaDeviceSynchronize();
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    for (int k = 0; k < flash_iters; k++)
+        flash_attn_kernel<<<grid_3d, Br>>>(
+            (const half2 *)Q_d, (const half2 *)K_d, (const half2 *)V_d,
+            O_d2, SEQ_LEN, SEQ_LEN, HEAD_DIM/2, 1.0f/sqrtf(HEAD_DIM), gqa_ratio);
+    cudaDeviceSynchronize();
+    auto t2 = std::chrono::high_resolution_clock::now();
+    float ms_flash = std::chrono::duration<float, std::milli>(t2 - t1).count();
+
+    cudaMemcpy(O_gpu, O_d2, n_q * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float max_err_flash = 0;
+    for (int i = 0; i < n_q; i++){
+        float err = fabsf(O_gpu[i] - O_h[i]);
+        if (err > max_err_flash) max_err_flash = err;
+    }
+    printf("Flash GPU vs CPU 最大误差: %f\n", max_err_flash);
+
+    printf("\n========== 性能对比 (SEQ=%d, D=%d, warmup=%d) ==========\n",
+        SEQ_LEN, HEAD_DIM, warmup);
+    printf("Naive:  %.4f ms/run  (total %.2f ms / %d runs)\n", ms_naive / iters, ms_naive, iters);
+    printf("Flash:  %.4f ms/run  (total %.2f ms / %d runs)\n", ms_flash / flash_iters, ms_flash, flash_iters);
+    printf("加速比: %.2fx\n", (ms_naive / iters) / (ms_flash / flash_iters));
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     delete[] O_gpu;
 
-    // 清理设备内存和主机内存
-    cudaFree(Q_d);cudaFree(K_d);cudaFree(V_d);cudaFree(O_d);
+    cudaFree(Q_d);cudaFree(K_d);cudaFree(V_d);cudaFree(O_d);cudaFree(O_d2);
     delete[] Q_h;delete[] K_h;delete[] V_h;delete[] O_h;
     delete[] Q_half;delete[] K_half;delete[] V_half;
 
-    printf("step 3 完成：完成CPU的标准计算\n");
-    
-
+    printf("\n第 3 周完成\n");
     return 0;
 }

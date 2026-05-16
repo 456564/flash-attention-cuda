@@ -173,43 +173,71 @@
    - 循环 256/64=4 次，搬运合理
    - SRAM 留余量给多 block 交替隐藏延迟
 
-6. **KV 加载为什么加 kv_start？**
-   - 循环 4 批读不同段 K[0..63], K[64..127], ...
-   - 不加 kv_start → 四批全读同一段 K[0..63]
+6. **因果 mask 在 flash kernel 的写法**
+   - `kv_start + j` = K 的全局行号，`q_start + my_row` = Q 的全局行号
+   - K 全局 > Q 全局 → 未来 token → `dot = -1e9f`
+   - 不能用 `continue` 跳过：softmax 分母需保留该位置，exp(-1e9f)≈0 刚好
+   - 因为 K 数组在 HBM 里一次性全在，硬件不管语义，程序员自己加约束
 
-7. **QK 点积的 j 循环作用？**
-   - j = 当前 K 块的第几行
-   - Q[my_row] 固定不动 → K[j] 逐行比较
-   - 每个 j 产出一个分数 → 存 KQ_local[j]
+7. **online softmax 贬值公式推导**
+   - 分块前：全部用全局 max，`exp(dot - global_max)`
+   - 分块后：先块用旧 max，发现新 max 更大时需修正
+   - `exp(dot - new_max) = exp(dot - old_max) × exp(old_max - new_max)`
+   - `scale_old = expf(KQ_max - new_max)` < 1 → 旧 VKQ 和 KQ_sum 等比贬值
+   - 新旧分母统一到新 max 基准，保证最终归一化正确
 
-8. **online softmax 为什么做旧值贬值？**
-   - 新 max > 旧 max → 旧的所有权重用 exp(旧max - 新max) 缩水
-   - 物理：读到后面发现更强关联 → 之前的注意力被等比稀释
+8. **KV_tile 分时复用**
+   - 同一块 SRAM，先装 K 算 QK 点积，再覆盖装 V 做加权累加
+   - K 算完分数后不需要了 → 安全覆盖
+   - K 加载和 V 加载代码一模一样，只改 `K[` → `V[`
 
-9. **GPU 硬件自动调度：block 切换无开销**
-   - SM 内多个 block → 一个等 HBM 时另一个算
-   - warp 切换 = 换寄存器指针，0 cycles
-   - 程序员零代码，硬件自动
+9. **VKQ 归一化：为什么 kv 循环外一把除**
+   - naive：`(score/sum) × V` → 每个 j 除一次
+   - flash：`(Σ score×V) / sum` → sum 是常数可提出来，循环外一把除
+   - 省 256 次除法，数学等价
+
+10. **grid 和 sram_bytes 计算**
+    - `grid = (SEQ_LEN + Br - 1) / Br` = ceil(256/32) = 8 个 block
+    - `sram_bytes = (Br + Bc) × head_dim_half × sizeof(half)` = 96×32×2 = 6144 字节
+    - SRAM 总需求 = Q_tile(2KB) + KV_tile(4KB) = 6KB < 48KB
+
+11. **<<< >>> 和 ( ) 的区别**
+    - `<<<grid, block, sram>>>` = 启动配置（告诉 GPU 怎么并行）
+    - `(参数1, 参数2, ...)` = 普通函数参数（传数据）
 
 ### 犯过的错
 
 1. **KV 加载忘了 __syncthreads()**
-   - 没等所有线程搬完就往下算 → 个别线程读到旧数据
 
 2. **K 访问忘了 kv_start 偏移**
-   - `K[row*head_dim_half+col]` 永远读 K[0..63]
 
 3. **half2 直接用 .x .y (语法错误)**
-   - 必须先 `__half22float2()` 转 float2
 
 4. **QK 点积忘了声明 dot 变量**
 
-5. **`__stncthreads()` 拼写错误**
+5. **`__stncthreads()` 拼写错误 → `__syncthreads()`**
 
-### 当前位置
+6. **贬值时 KQ_sum 忘了乘 old_scale**
+   - VKQ 贬值了但分母没贬 → 权重和不等于 1
+   - 正确：VKQ[d] *= old_scale 同时 KQ_sum *= old_scale
 
-flash_attn_mini_s1.cu 第 103-110 行的 QK 点积待修复：
-- 缺 j 外层循环
-- dot 变量未声明
-- half2 未转 float2
-- 缺 KQ_local 暂存 + new_max 更新
+7. **贬值循环上界用 head_dim_half 而非 HEAD_DIM**
+   - VKQ 累加用 `VKQ[2*d]` `VKQ[2*d+1]` 填了 64 个 float
+   - 贬值只跑 32 次 → 奇数位漏贬
+   - 正确：`d < HEAD_DIM`(64)
+
+8. **SRAM 大小算错**
+   - 传了 `Br × HEAD_DIM × sizeof(half)` = 4KB，忘了 KV_tile 需要额外 4KB
+   - 正确：`(Br + Bc) × (HEAD_DIM/2) × sizeof(half)` = 6KB
+
+9. **main() 里 O_d2 用 new 分配又被 cudaMalloc 覆盖**
+   - `float *O_d2 = new float[n]` 泄漏 CPU 内存
+   - 正确：`float *O_d2; cudaMalloc(&O_d2, ...)`
+
+10. **naive 比较在 flash 覆盖 O_gpu 后**
+    - O_gpu 先存 naive 结果，后被 flash 结果覆盖
+    - naive 比较必须在 flash 之前做
+
+### 验证结果
+
+板子编译运行：Naive 误差 0.000015，Flash 误差 0.000015。FP16 精度范围内一致。
