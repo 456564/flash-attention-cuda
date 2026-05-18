@@ -26,3 +26,7 @@ models/*.gguf
 # OS
 .DS_Store
 Thumbs.db
+
+# Compiled binaries
+flash_attention/flash_attn_mini
+flash_attention/flash_attn_mini_s1
